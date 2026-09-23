@@ -1,108 +1,275 @@
 "use strict";
 
-const { addLog, getLogs } = require("./logger");
+const { addLog } = require("./logger");
 const mineflayer = require("mineflayer");
-const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
-const { GoalBlock } = goals;
+const { Movements, pathfinder } = require("mineflayer-pathfinder");
 const config = require("./settings.json");
 const express = require("express");
-const http = require("http");
-const https = require("https");
 
 // ============================================================
-// EXPRESS SERVER - Keep Render/Aternos alive
+// EXPRESS SERVER - DASHBOARD & KEEP ALIVE
 // ============================================================
 const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 5000;
 
-// Bot state tracking
 let botState = {
   connected: false,
   lastActivity: Date.now(),
   reconnectAttempts: 0,
   startTime: Date.now(),
-  errors: [],
   wasThrottled: false,
 };
 
-// Health check endpoint for monitoring
-app.get('/', (req, res) => {
+app.get("/", (req, res) => {
   res.send(`
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="hi">
       <head>
         <title>${config.name} Dashboard</title>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link rel="stylesheet" media="print" onload="this.media='all'"
-              href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
         <style>
-          *, *::before, *::after { box-sizing: border-box; }
-
-          body {
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: #0d1117;
-            color: #e6edf3;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            margin: 0;
-            padding: 24px;
+          body { font-family: Arial, sans-serif; background: #0d1117; color: #e6edf3; padding: 24px; text-align: center; }
+          .online { color: #3fb950; font-weight: bold; } 
+          .offline { color: #f85149; font-weight: bold; }
+        </style>
+      </head>
+      <body>
+        <h1>${config.name} Dashboard (MC Hosting)</h1>
+        <p>Status: <span id="status">Connecting...</span></p>
+        <script>
+          async function update() {
+            try {
+              const r = await fetch('/health');
+              const data = await r.json();
+              document.getElementById('status').innerText = data.status.toUpperCase();
+              document.getElementById('status').className = data.status === 'connected' ? 'online' : 'offline';
+            } catch (e) {}
           }
+          setInterval(update, 5000); 
+          update();
+        </script>
+      </body>
+    </html>
+  `);
+});
 
-          main { width: 100%; max-width: 400px; }
+app.get("/health", (req, res) => {
+  res.json({
+    status: botState.connected ? "connected" : "disconnected",
+    uptime: Math.floor((Date.now() - botState.startTime) / 1000),
+    coords: bot && bot.entity ? bot.entity.position : null,
+    reconnectAttempts: botState.reconnectAttempts,
+  });
+});
 
-          header { margin-bottom: 28px; }
-          header h1 {
-            font-size: 26px;
-            font-weight: 700;
-            color: #f0f6fc;
-            margin: 0;
-            line-height: 1.2;
-          }
-          header p {
-            font-size: 14px;
-            color: #8b949e;
-            margin: 6px 0 0;
-            line-height: 1.5;
-          }
+app.get("/ping", (req, res) => res.send("pong"));
 
-          .status-section {
-            border-radius: 12px;
-            padding: 20px 24px;
-            margin-bottom: 16px;
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            transition: background 0.3s, border-color 0.3s;
-          }
-          .status-section.online  { background: #0d2218; border: 2px solid #238636; }
-          .status-section.offline { background: #200d0d; border: 2px solid #da3633; }
+const server = app.listen(PORT, "0.0.0.0", () => {
+  addLog(`[Server] Web Dashboard runs on port ${server.address().port}`);
+});
 
-          .status-icon {
-            width: 44px; height: 44px;
-            border-radius: 50%;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 20px; flex-shrink: 0;
-            transition: background 0.3s;
-          }
-          .status-icon.online  { background: #238636; }
-          .status-icon.offline { background: #da3633; }
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    server.listen(PORT + 1, "0.0.0.0");
+  }
+});
 
-          .status-label { font-size: 18px; font-weight: 700; line-height: 1.2; transition: color 0.3s; }
-          .status-label.online  { color: #3fb950; }
-          .status-label.offline { color: #f85149; }
-          .status-detail { font-size: 13px; color: #8b949e; margin-top: 3px; }
+// ============================================================
+// BOT MANAGEMENT & RECONNECT SYSTEM
+// ============================================================
+let bot = null;
+let activeIntervals = [];
+let reconnectTimeoutId = null;
+let connectionTimeoutId = null;
+let isReconnecting = false;
 
-          dl { margin: 0; }
-          .stat-card {
-            background: #161b22;
-            border: 1px solid #21262d;
-            border-radius: 10px;
-            padding: 16px 20px;
-            margin-bottom: 10px;
+function clearBotTimeouts() {
+  if (reconnectTimeoutId) { clearTimeout(reconnectTimeoutId); reconnectTimeoutId = null; }
+  if (connectionTimeoutId) { clearTimeout(connectionTimeoutId); connectionTimeoutId = null; }
+}
+
+function clearAllIntervals() {
+  activeIntervals.forEach((id) => clearInterval(id));
+  activeIntervals = [];
+}
+
+function addInterval(callback, delay) {
+  const id = setInterval(callback, delay);
+  activeIntervals.push(id);
+  return id;
+}
+
+function getReconnectDelay() {
+  if (botState.wasThrottled) {
+    botState.wasThrottled = false;
+    return 60000; // MC Hosting Rate Limit Protection (1 min)
+  }
+  const baseDelay = config.utils ? (config.utils["auto-reconnect-delay"] || 5000) : 5000;
+  return Math.min(baseDelay * Math.pow(1.2, botState.reconnectAttempts), 30000);
+}
+
+function createBot() {
+  if (isReconnecting) return;
+
+  if (bot) {
+    clearAllIntervals();
+    try {
+      bot.removeAllListeners();
+      bot.end();
+    } catch (e) {}
+    bot = null;
+  }
+
+  addLog(`[Bot] Connecting to MC Hosting Server: ${config.server.ip}:${config.server.port}...`);
+
+  try {
+    const botVersion = (config.server.version && config.server.version.trim() !== "") 
+      ? config.server.version 
+      : false; // Auto-detect Minecraft version
+
+    bot = mineflayer.createBot({
+      username: config["bot-account"].username,
+      password: config["bot-account"].password || undefined,
+      auth: config["bot-account"].type || "offline",
+      host: config.server.ip,
+      port: config.server.port,
+      version: botVersion,
+      checkTimeoutInterval: 60000,
+    });
+
+    bot.loadPlugin(pathfinder);
+
+    clearBotTimeouts();
+    connectionTimeoutId = setTimeout(() => {
+      if (!botState.connected) {
+        addLog("[Bot] Connection timed out! Reconnecting...");
+        cleanupAndReconnect();
+      }
+    }, 90000); // 90 Seconds Timeout
+
+    let spawnHandled = false;
+    bot.once("spawn", () => {
+      if (spawnHandled) return;
+      spawnHandled = true;
+
+      clearBotTimeouts();
+      botState.connected = true;
+      botState.reconnectAttempts = 0;
+      isReconnecting = false;
+      addLog(`[Bot] Successfully spawned in MC Hosting server!`);
+
+      const mcData = require("minecraft-data")(bot.version);
+      const defaultMove = new Movements(bot, mcData);
+      bot.pathfinder.setMovements(defaultMove);
+
+      initializeModules(bot);
+    });
+
+    bot.on("kicked", (reason) => {
+      const kickReason = typeof reason === "object" ? JSON.stringify(reason) : reason;
+      addLog(`[Bot] Kicked from server: ${kickReason}`);
+      botState.connected = false;
+
+      if (String(kickReason).toLowerCase().includes("throttl") || String(kickReason).toLowerCase().includes("rate limit")) {
+        botState.wasThrottled = true;
+      }
+    });
+
+    bot.on("end", (reason) => {
+      addLog(`[Bot] Disconnected: ${reason || "Connection ended"}`);
+      botState.connected = false;
+      clearAllIntervals();
+      scheduleReconnect();
+    });
+
+    bot.on("error", (err) => {
+      addLog(`[Bot Error] ${err.message}`);
+    });
+
+  } catch (err) {
+    addLog(`[Bot Creation Error] ${err.message}`);
+    scheduleReconnect();
+  }
+}
+
+function cleanupAndReconnect() {
+  if (bot) {
+    try {
+      bot.removeAllListeners();
+      bot.end();
+    } catch (e) {}
+    bot = null;
+  }
+  scheduleReconnect();
+}
+
+function scheduleReconnect() {
+  clearBotTimeouts();
+  if (isReconnecting) return;
+
+  isReconnecting = true;
+  botState.reconnectAttempts++;
+  const delay = getReconnectDelay();
+
+  addLog(`[Bot] Reconnecting in ${Math.round(delay / 1000)} seconds...`);
+
+  reconnectTimeoutId = setTimeout(() => {
+    reconnectTimeoutId = null;
+    isReconnecting = false;
+    createBot();
+  }, delay);
+}
+
+// ============================================================
+// AUTOMATION & ANTI-AFK MODULES
+// ============================================================
+function initializeModules(botInstance) {
+  // 1. Auto Register/Login Support
+  if (config.utils && config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
+    const pass = config.utils["auto-auth"].password;
+    botInstance.on("messagestr", (msg) => {
+      const lower = msg.toLowerCase();
+      if (lower.includes("/register")) {
+        botInstance.chat(`/register ${pass} ${pass}`);
+      } else if (lower.includes("/login")) {
+        botInstance.chat(`/login ${pass}`);
+      }
+    });
+  }
+
+  // 2. Anti-AFK Action Interval
+  if (config.utils && config.utils["anti-afk"] && config.utils["anti-afk"].enabled) {
+    addInterval(() => {
+      if (botInstance && botState.connected) {
+        try {
+          // स्विंग आर्म (हात हिलाना) और थोड़ा सा रोटेशन ताकि AFK किक न हो
+          botInstance.swingArm();
+          const yaw = (Math.random() - 0.5) * 0.5;
+          const pitch = (Math.random() - 0.5) * 0.5;
+          botInstance.look(botInstance.entity.yaw + yaw, botInstance.entity.pitch + pitch, false);
+        } catch (e) {}
+      }
+    }, 12000);
+  }
+}
+
+// ============================================================
+// CRASH PROTECTION (UNCAUGHT EXCEPTIONS)
+// ============================================================
+process.on("uncaughtException", (err) => {
+  addLog(`[Uncaught Exception Fixer] ${err.message}`);
+  isReconnecting = false;
+  clearBotTimeouts();
+  scheduleReconnect();
+});
+
+process.on("unhandledRejection", (reason) => {
+  addLog(`[Unhandled Rejection Fixer] ${reason}`);
+});
+
+// Start the bot execution
+createBot();
           }
           dt { font-size: 12px; color: #8b949e; font-weight: 600; margin-bottom: 4px; }
           dd { margin: 0; font-size: 17px; font-weight: 600; color: #e6edf3; line-height: 1.3; }
